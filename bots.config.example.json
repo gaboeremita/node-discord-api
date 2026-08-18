@@ -1,0 +1,3 @@
+[
+	{ "name": "vera", "tokenEnv": "VERA_DISCORD_TOKEN", "assistantIdEnv": "VERA_ASSISTANT_ID" }
+]

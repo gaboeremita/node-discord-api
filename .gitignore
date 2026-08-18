@@ -1,0 +1,4 @@
+node_modules/
+.env
+bots.config.json
+.idea/
