@@ -2,7 +2,7 @@ require('dotenv').config();
 
 const fs = require('fs');
 const express = require('express');
-const { Client, Events, GatewayIntentBits, ChannelType } = require('discord.js');
+const { Client, Events, GatewayIntentBits, ChannelType, Partials } = require('discord.js');
 
 const BOTS_CONFIG_PATH = './bots.config.json';
 
@@ -69,7 +69,7 @@ function chunkText(text, size = MESSAGE_CHUNK_SIZE) {
 	return chunks;
 }
 
-function createBot({ name, tokenEnv, assistantIdEnv }) {
+function createBot({ name, tokenEnv, assistantIdEnv, dmAllowlistEnv }) {
 	const token = process.env[tokenEnv];
 	const assistantId = Number(process.env[assistantIdEnv]);
 
@@ -83,12 +83,25 @@ function createBot({ name, tokenEnv, assistantIdEnv }) {
 		return;
 	}
 
+	const dmAllowlist = new Set(
+		(dmAllowlistEnv && process.env[dmAllowlistEnv] || '')
+			.split(',')
+			.map((id) => id.trim())
+			.filter(Boolean)
+	);
+
+	if (dmAllowlist.size === 0) {
+		console.log(`[${name}] DMs disabled — ${dmAllowlistEnv ?? 'no dmAllowlistEnv configured'} is empty`);
+	}
+
 	const client = new Client({
 		intents: [
 			GatewayIntentBits.Guilds,
 			GatewayIntentBits.GuildMessages,
+			GatewayIntentBits.DirectMessages,
 			GatewayIntentBits.MessageContent,
 		],
+		partials: [Partials.Channel],
 	});
 
 	let channelConfig = new Map();
@@ -110,9 +123,13 @@ function createBot({ name, tokenEnv, assistantIdEnv }) {
 	client.on(Events.MessageCreate, async (message) => {
 		if (message.author.bot) return;
 
-		const triggerMode = channelConfig.get(message.channel.id);
-		if (!triggerMode || triggerMode === 'off') return;
-		if (triggerMode === 'mention' && !message.mentions.users.has(client.user.id)) return;
+		if (message.channel.type === ChannelType.DM) {
+			if (!dmAllowlist.has(message.author.id)) return;
+		} else {
+			const triggerMode = channelConfig.get(message.channel.id);
+			if (!triggerMode || triggerMode === 'off') return;
+			if (triggerMode === 'mention' && !message.mentions.users.has(client.user.id)) return;
+		}
 
 		console.log(`[${name}] [${message.guild?.name ?? 'DM'} #${message.channel.name ?? ''}] ${message.author.tag}: ${message.content}`);
 
