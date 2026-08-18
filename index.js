@@ -110,11 +110,11 @@ function createBot({ name, tokenEnv, assistantIdEnv }) {
 	client.on(Events.MessageCreate, async (message) => {
 		if (message.author.bot) return;
 
-		console.log(`[${name}] [${message.guild?.name ?? 'DM'} #${message.channel.name ?? ''}] ${message.author.tag}: ${message.content}`);
-
 		const triggerMode = channelConfig.get(message.channel.id);
 		if (!triggerMode || triggerMode === 'off') return;
 		if (triggerMode === 'mention' && !message.mentions.users.has(client.user.id)) return;
+
+		console.log(`[${name}] [${message.guild?.name ?? 'DM'} #${message.channel.name ?? ''}] ${message.author.tag}: ${message.content}`);
 
 		let typingInterval;
 
