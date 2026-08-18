@@ -36,7 +36,7 @@ Fill in `bots.config.json` — one entry per bot, referencing the env var names 
 
 ```json
 [
-  { "name": "vera", "tokenEnv": "VERA_DISCORD_TOKEN", "assistantIdEnv": "VERA_ASSISTANT_ID" }
+  { "name": "bot's name", "tokenEnv": "BOT_DISCORD_TOKEN", "assistantIdEnv": "BOT_ASSISTANT_ID" }
 ]
 ```
 
