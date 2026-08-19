@@ -2,7 +2,7 @@ require('dotenv').config();
 
 const fs = require('fs');
 const express = require('express');
-const { Client, Events, GatewayIntentBits, ChannelType, Partials } = require('discord.js');
+const { Client, Events, GatewayIntentBits, ChannelType, Partials, AttachmentBuilder } = require('discord.js');
 
 const BOTS_CONFIG_PATH = './bots.config.json';
 
@@ -52,6 +52,12 @@ async function downloadAttachmentAsBase64(url) {
 	const res = await fetch(url);
 	const buffer = await res.arrayBuffer();
 	return Buffer.from(buffer).toString('base64');
+}
+
+async function downloadAttachmentAsBuffer(url) {
+	const res = await fetch(url);
+	const buffer = await res.arrayBuffer();
+	return Buffer.from(buffer);
 }
 
 function chunkText(text, size = MESSAGE_CHUNK_SIZE) {
@@ -162,8 +168,20 @@ function createBot({ name, tokenEnv, assistantIdEnv, dmAllowlistEnv }) {
 			}
 
 			const data = await res.json();
+			const chunks = chunkText(data.content ?? '');
 
-			for (const chunk of chunkText(data.content ?? '')) {
+			if (data.image_url) {
+				const imageBuffer = await downloadAttachmentAsBuffer(data.image_url);
+				const attachment = new AttachmentBuilder(imageBuffer, { name: 'image.png' });
+
+				const firstChunk = chunks.shift();
+				await message.channel.send({
+					...(firstChunk ? { content: firstChunk } : {}),
+					files: [attachment],
+				});
+			}
+
+			for (const chunk of chunks) {
 				await message.channel.send(chunk);
 			}
 		} catch (err) {
