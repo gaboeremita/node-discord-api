@@ -157,6 +157,7 @@ function createBot({ name, tokenEnv, assistantIdEnv, dmAllowlistEnv }) {
 					channel_id: message.channel.id,
 					message_id: message.id,
 					content: message.content,
+					...(message.channel.type === ChannelType.DM ? { dm_username: message.author.username } : {}),
 					...(images.length ? { images } : {}),
 				}),
 			});
