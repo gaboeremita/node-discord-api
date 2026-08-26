@@ -19,7 +19,7 @@ const CONFIG_REFRESH_INTERVAL_MS = 60_000;
 const TYPING_REFRESH_INTERVAL_MS = 8_000;
 const MESSAGE_CHUNK_SIZE = 1900;
 const MAX_BOT_REPLY_CHAIN = 2;
-const BOT_REPLY_COOLDOWN_MS = 30_000;
+const BOT_REPLY_COOLDOWN_MS = 10_000;
 
 const botsByAssistantId = new Map();
 
@@ -64,6 +64,13 @@ async function downloadAttachmentAsBuffer(url) {
 
 function normalizeForNameMatch(str) {
 	return str.toLowerCase().replace(/[\s_.-]+/g, '');
+}
+
+function nameMatchTerms(username) {
+	return username
+		.toLowerCase()
+		.split(/[\s_.-]+/)
+		.filter(Boolean);
 }
 
 function chunkText(text, size = MESSAGE_CHUNK_SIZE) {
@@ -150,7 +157,8 @@ function createBot({ name, tokenEnv, assistantIdEnv, dmAllowlistEnv }) {
 
 			if (triggerMode === 'mentioned_by_name') {
 				const mentionedByTag = message.mentions.users.has(client.user.id);
-				const mentionedByName = normalizeForNameMatch(message.content).includes(normalizeForNameMatch(client.user.username));
+				const normalizedContent = normalizeForNameMatch(message.content);
+				const mentionedByName = nameMatchTerms(client.user.username).some((term) => normalizedContent.includes(term));
 				if (!mentionedByTag && !mentionedByName) return;
 			}
 
