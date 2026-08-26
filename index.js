@@ -18,6 +18,8 @@ const LARAVEL_API_TOKEN = process.env.DISCORD_API_TOKEN;
 const CONFIG_REFRESH_INTERVAL_MS = 60_000;
 const TYPING_REFRESH_INTERVAL_MS = 8_000;
 const MESSAGE_CHUNK_SIZE = 1900;
+const MAX_BOT_REPLY_CHAIN = 2;
+const BOT_REPLY_COOLDOWN_MS = 30_000;
 
 const botsByAssistantId = new Map();
 
@@ -58,6 +60,10 @@ async function downloadAttachmentAsBuffer(url) {
 	const res = await fetch(url);
 	const buffer = await res.arrayBuffer();
 	return Buffer.from(buffer);
+}
+
+function normalizeForNameMatch(str) {
+	return str.toLowerCase().replace(/[\s_.-]+/g, '');
 }
 
 function chunkText(text, size = MESSAGE_CHUNK_SIZE) {
@@ -111,6 +117,8 @@ function createBot({ name, tokenEnv, assistantIdEnv, dmAllowlistEnv }) {
 	});
 
 	let channelConfig = new Map();
+	const channelChains = new Map();
+	const botReplyCooldowns = new Map();
 
 	const refreshConfig = async () => {
 		try {
@@ -127,14 +135,33 @@ function createBot({ name, tokenEnv, assistantIdEnv, dmAllowlistEnv }) {
 	});
 
 	client.on(Events.MessageCreate, async (message) => {
-		if (message.author.bot) return;
+		if (message.author.id === client.user.id) return;
 
 		if (message.channel.type === ChannelType.DM) {
 			if (!dmAllowlist.has(message.author.id)) return;
 		} else {
+			if (!message.author.bot) {
+				channelChains.delete(message.channel.id);
+			}
+
 			const triggerMode = channelConfig.get(message.channel.id);
 			if (!triggerMode || triggerMode === 'off') return;
 			if (triggerMode === 'mention' && !message.mentions.users.has(client.user.id)) return;
+
+			if (triggerMode === 'mentioned_by_name') {
+				const mentionedByTag = message.mentions.users.has(client.user.id);
+				const mentionedByName = normalizeForNameMatch(message.content).includes(normalizeForNameMatch(client.user.username));
+				if (!mentionedByTag && !mentionedByName) return;
+			}
+
+			if (message.author.bot) {
+				const chainLength = channelChains.get(message.channel.id) ?? 0;
+				if (chainLength >= MAX_BOT_REPLY_CHAIN) return;
+
+				const cooldownKey = `${message.channel.id}:${message.author.id}`;
+				const lastReplyAt = botReplyCooldowns.get(cooldownKey);
+				if (lastReplyAt && Date.now() - lastReplyAt < BOT_REPLY_COOLDOWN_MS) return;
+			}
 		}
 
 		console.log(`[${name}] [${message.guild?.name ?? 'DM'} #${message.channel.name ?? ''}] ${message.author.tag}: ${message.content}`);
@@ -184,6 +211,11 @@ function createBot({ name, tokenEnv, assistantIdEnv, dmAllowlistEnv }) {
 
 			for (const chunk of chunks) {
 				await message.channel.send(chunk);
+			}
+
+			if (message.channel.type !== ChannelType.DM && message.author.bot) {
+				channelChains.set(message.channel.id, (channelChains.get(message.channel.id) ?? 0) + 1);
+				botReplyCooldowns.set(`${message.channel.id}:${message.author.id}`, Date.now());
 			}
 		} catch (err) {
 			console.error(`[${name}] Message handling failed: ${err.message}`);
