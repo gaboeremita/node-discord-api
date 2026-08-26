@@ -168,7 +168,10 @@ function createBot({ name, tokenEnv, assistantIdEnv, dmAllowlistEnv }) {
 
 				const cooldownKey = `${message.channel.id}:${message.author.id}`;
 				const lastReplyAt = botReplyCooldowns.get(cooldownKey);
-				if (lastReplyAt && Date.now() - lastReplyAt < BOT_REPLY_COOLDOWN_MS) return;
+				const remainingCooldownMs = lastReplyAt ? BOT_REPLY_COOLDOWN_MS - (Date.now() - lastReplyAt) : 0;
+				if (remainingCooldownMs > 0) {
+					await new Promise((resolve) => setTimeout(resolve, remainingCooldownMs));
+				}
 			}
 		}
 
