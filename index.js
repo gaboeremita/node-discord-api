@@ -19,10 +19,35 @@ const CONFIG_REFRESH_INTERVAL_MS = 60_000;
 const TYPING_REFRESH_INTERVAL_MS = 8_000;
 const MESSAGE_CHUNK_SIZE = 1900;
 const MAX_BOT_REPLY_CHAIN = 2;
-const CHAIN_CAP_COOLDOWN_MS = 60_000;
-const API_CALL_COOLDOWN_MS = 10_000;
+const LOG_FILE_PATH = './discord-api.log';
 
 const botsByAssistantId = new Map();
+
+// Shared across every bot so at most one request to Laravel/the LLM provider is ever in
+// flight at a time, regardless of how many bots are running or how much they message each other.
+let requestQueue = Promise.resolve();
+
+function enqueue(task) {
+	const run = requestQueue.then(task, task);
+	requestQueue = run.catch(() => {});
+	return run;
+}
+
+function logError(context, { message, code = null, stack = null } = {}) {
+	const entry = {
+		timestamp: new Date().toISOString(),
+		context,
+		message,
+		code,
+		stack,
+	};
+
+	console.error(`[${context}] ${message}${code ? ` (${code})` : ''}`);
+
+	fs.appendFile(LOG_FILE_PATH, JSON.stringify(entry) + '\n', (writeErr) => {
+		if (writeErr) console.error(`Failed to write to ${LOG_FILE_PATH}: ${writeErr.message}`);
+	});
+}
 
 function laravelHeaders(extra = {}) {
 	return {
@@ -126,14 +151,12 @@ function createBot({ name, tokenEnv, assistantIdEnv, dmAllowlistEnv }) {
 
 	let channelConfig = new Map();
 	const channelChains = new Map();
-	const channelChainCapHitAt = new Map();
-	const lastApiCallAtByChannel = new Map();
 
 	const refreshConfig = async () => {
 		try {
 			channelConfig = await fetchChannelConfig(assistantId);
 		} catch (err) {
-			console.error(`[${name}] Failed to refresh channel config: ${err.message}`);
+			logError(`${name}: refresh-config`, { message: err.message, code: err.code, stack: err.stack });
 		}
 	};
 
@@ -151,7 +174,6 @@ function createBot({ name, tokenEnv, assistantIdEnv, dmAllowlistEnv }) {
 		} else {
 			if (!message.author.bot) {
 				channelChains.delete(message.channel.id);
-				channelChainCapHitAt.delete(message.channel.id);
 			}
 
 			const triggerMode = channelConfig.get(message.channel.id);
@@ -167,85 +189,71 @@ function createBot({ name, tokenEnv, assistantIdEnv, dmAllowlistEnv }) {
 
 			if (message.author.bot) {
 				const chainLength = channelChains.get(message.channel.id) ?? 0;
-				if (chainLength >= MAX_BOT_REPLY_CHAIN) {
-					const capHitAt = channelChainCapHitAt.get(message.channel.id);
-					if (!capHitAt || Date.now() - capHitAt < CHAIN_CAP_COOLDOWN_MS) return;
-
-					channelChains.delete(message.channel.id);
-					channelChainCapHitAt.delete(message.channel.id);
-				}
+				if (chainLength >= MAX_BOT_REPLY_CHAIN) return;
 			}
 		}
-
-		const lastApiCallAt = lastApiCallAtByChannel.get(message.channel.id) ?? 0;
-		const remainingApiCooldownMs = API_CALL_COOLDOWN_MS - (Date.now() - lastApiCallAt);
-		if (remainingApiCooldownMs > 0) {
-			await new Promise((resolve) => setTimeout(resolve, remainingApiCooldownMs));
-		}
-		lastApiCallAtByChannel.set(message.channel.id, Date.now());
 
 		console.log(`[${name}] [${message.guild?.name ?? 'DM'} #${message.channel.name ?? ''}] ${message.author.tag}: ${message.content}`);
 
-		let typingInterval;
+		await enqueue(async () => {
+			let typingInterval;
 
-		try {
-			await message.channel.sendTyping();
-			typingInterval = setInterval(() => {
-				message.channel.sendTyping().catch(() => {});
-			}, TYPING_REFRESH_INTERVAL_MS);
+			try {
+				await message.channel.sendTyping();
+				typingInterval = setInterval(() => {
+					message.channel.sendTyping().catch(() => {});
+				}, TYPING_REFRESH_INTERVAL_MS);
 
-			const attachment = message.attachments.first();
-			const images = attachment ? [await downloadAttachmentAsBase64(attachment.url)] : [];
+				const attachment = message.attachments.first();
+				const images = attachment ? [await downloadAttachmentAsBase64(attachment.url)] : [];
 
-			const res = await fetch(`${LARAVEL_API_URL}/assistants/${assistantId}/discord-messages`, {
-				method: 'POST',
-				headers: laravelHeaders({ 'Content-Type': 'application/json' }),
-				body: JSON.stringify({
-					channel_id: message.channel.id,
-					message_id: message.id,
-					content: message.content,
-					...(message.channel.type === ChannelType.DM ? { dm_username: message.author.username } : {}),
-					...(images.length ? { images } : {}),
-				}),
-			});
-
-			if (!res.ok) {
-				console.error(`[${name}] discord-messages request failed: ${res.status}`);
-				await message.channel.send('Connection failed. Try again.');
-				return;
-			}
-
-			const data = await res.json();
-			const chunks = chunkText(data.content ?? '');
-
-			if (data.image_url) {
-				const imageBuffer = await downloadAttachmentAsBuffer(data.image_url);
-				const attachment = new AttachmentBuilder(imageBuffer, { name: 'image.png' });
-
-				const firstChunk = chunks.shift();
-				await message.channel.send({
-					...(firstChunk ? { content: firstChunk } : {}),
-					files: [attachment],
+				const res = await fetch(`${LARAVEL_API_URL}/assistants/${assistantId}/discord-messages`, {
+					method: 'POST',
+					headers: laravelHeaders({ 'Content-Type': 'application/json' }),
+					body: JSON.stringify({
+						channel_id: message.channel.id,
+						message_id: message.id,
+						content: message.content,
+						...(message.channel.type === ChannelType.DM ? { dm_username: message.author.username } : {}),
+						...(images.length ? { images } : {}),
+					}),
 				});
-			}
 
-			for (const chunk of chunks) {
-				await message.channel.send(chunk);
-			}
-
-			if (message.channel.type !== ChannelType.DM && message.author.bot) {
-				const newChainLength = (channelChains.get(message.channel.id) ?? 0) + 1;
-				channelChains.set(message.channel.id, newChainLength);
-				if (newChainLength >= MAX_BOT_REPLY_CHAIN) {
-					channelChainCapHitAt.set(message.channel.id, Date.now());
+				if (!res.ok) {
+					const body = await res.text().catch(() => '');
+					logError(`${name}: discord-messages`, { message: body || res.statusText, code: res.status });
+					await message.channel.send('Connection failed. Try again.');
+					return;
 				}
+
+				const data = await res.json();
+				const chunks = chunkText(data.content ?? '');
+
+				if (data.image_url) {
+					const imageBuffer = await downloadAttachmentAsBuffer(data.image_url);
+					const attachment = new AttachmentBuilder(imageBuffer, { name: 'image.png' });
+
+					const firstChunk = chunks.shift();
+					await message.channel.send({
+						...(firstChunk ? { content: firstChunk } : {}),
+						files: [attachment],
+					});
+				}
+
+				for (const chunk of chunks) {
+					await message.channel.send(chunk);
+				}
+
+				if (message.channel.type !== ChannelType.DM && message.author.bot) {
+					channelChains.set(message.channel.id, (channelChains.get(message.channel.id) ?? 0) + 1);
+				}
+			} catch (err) {
+				logError(`${name}: message-handling`, { message: err.message, code: err.code ?? err.cause?.code ?? null, stack: err.stack });
+				await message.channel.send('Connection failed. Try again.').catch(() => {});
+			} finally {
+				clearInterval(typingInterval);
 			}
-		} catch (err) {
-			console.error(`[${name}] Message handling failed: ${err.message}`);
-			await message.channel.send('Connection failed. Try again.').catch(() => {});
-		} finally {
-			clearInterval(typingInterval);
-		}
+		});
 	});
 
 	client.login(token);
