@@ -19,7 +19,8 @@ const CONFIG_REFRESH_INTERVAL_MS = 60_000;
 const TYPING_REFRESH_INTERVAL_MS = 8_000;
 const MESSAGE_CHUNK_SIZE = 1900;
 const MAX_BOT_REPLY_CHAIN = 2;
-const BOT_REPLY_COOLDOWN_MS = 10_000;
+const CHAIN_CAP_COOLDOWN_MS = 60_000;
+const API_CALL_COOLDOWN_MS = 10_000;
 
 const botsByAssistantId = new Map();
 
@@ -125,7 +126,8 @@ function createBot({ name, tokenEnv, assistantIdEnv, dmAllowlistEnv }) {
 
 	let channelConfig = new Map();
 	const channelChains = new Map();
-	const botReplyCooldowns = new Map();
+	const channelChainCapHitAt = new Map();
+	const lastApiCallAtByChannel = new Map();
 
 	const refreshConfig = async () => {
 		try {
@@ -149,6 +151,7 @@ function createBot({ name, tokenEnv, assistantIdEnv, dmAllowlistEnv }) {
 		} else {
 			if (!message.author.bot) {
 				channelChains.delete(message.channel.id);
+				channelChainCapHitAt.delete(message.channel.id);
 			}
 
 			const triggerMode = channelConfig.get(message.channel.id);
@@ -164,16 +167,22 @@ function createBot({ name, tokenEnv, assistantIdEnv, dmAllowlistEnv }) {
 
 			if (message.author.bot) {
 				const chainLength = channelChains.get(message.channel.id) ?? 0;
-				if (chainLength >= MAX_BOT_REPLY_CHAIN) return;
+				if (chainLength >= MAX_BOT_REPLY_CHAIN) {
+					const capHitAt = channelChainCapHitAt.get(message.channel.id);
+					if (!capHitAt || Date.now() - capHitAt < CHAIN_CAP_COOLDOWN_MS) return;
 
-				const cooldownKey = `${message.channel.id}:${message.author.id}`;
-				const lastReplyAt = botReplyCooldowns.get(cooldownKey);
-				const remainingCooldownMs = lastReplyAt ? BOT_REPLY_COOLDOWN_MS - (Date.now() - lastReplyAt) : 0;
-				if (remainingCooldownMs > 0) {
-					await new Promise((resolve) => setTimeout(resolve, remainingCooldownMs));
+					channelChains.delete(message.channel.id);
+					channelChainCapHitAt.delete(message.channel.id);
 				}
 			}
 		}
+
+		const lastApiCallAt = lastApiCallAtByChannel.get(message.channel.id) ?? 0;
+		const remainingApiCooldownMs = API_CALL_COOLDOWN_MS - (Date.now() - lastApiCallAt);
+		if (remainingApiCooldownMs > 0) {
+			await new Promise((resolve) => setTimeout(resolve, remainingApiCooldownMs));
+		}
+		lastApiCallAtByChannel.set(message.channel.id, Date.now());
 
 		console.log(`[${name}] [${message.guild?.name ?? 'DM'} #${message.channel.name ?? ''}] ${message.author.tag}: ${message.content}`);
 
@@ -225,8 +234,11 @@ function createBot({ name, tokenEnv, assistantIdEnv, dmAllowlistEnv }) {
 			}
 
 			if (message.channel.type !== ChannelType.DM && message.author.bot) {
-				channelChains.set(message.channel.id, (channelChains.get(message.channel.id) ?? 0) + 1);
-				botReplyCooldowns.set(`${message.channel.id}:${message.author.id}`, Date.now());
+				const newChainLength = (channelChains.get(message.channel.id) ?? 0) + 1;
+				channelChains.set(message.channel.id, newChainLength);
+				if (newChainLength >= MAX_BOT_REPLY_CHAIN) {
+					channelChainCapHitAt.set(message.channel.id, Date.now());
+				}
 			}
 		} catch (err) {
 			console.error(`[${name}] Message handling failed: ${err.message}`);
