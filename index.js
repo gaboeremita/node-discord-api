@@ -21,6 +21,16 @@ const MESSAGE_CHUNK_SIZE = 1900;
 const MAX_BOT_REPLY_CHAIN = 2;
 const LOG_FILE_PATH = './discord-api.log';
 
+const AUDIO_EXTENSIONS = {
+	'audio/ogg': 'ogg',
+	'audio/mpeg': 'mp3',
+	'audio/mp3': 'mp3',
+	'audio/wav': 'wav',
+	'audio/x-wav': 'wav',
+	'audio/webm': 'webm',
+	'audio/mp4': 'mp4',
+};
+
 const botsByAssistantId = new Map();
 
 // Shared across every bot so at most one request to Laravel/the LLM provider is ever in
@@ -232,6 +242,18 @@ function createBot({ name, tokenEnv, assistantIdEnv, dmAllowlistEnv }) {
 				if (data.image_url) {
 					const imageBuffer = await downloadAttachmentAsBuffer(data.image_url);
 					const attachment = new AttachmentBuilder(imageBuffer, { name: 'image.png' });
+
+					const firstChunk = chunks.shift();
+					await message.channel.send({
+						...(firstChunk ? { content: firstChunk } : {}),
+						files: [attachment],
+					});
+				}
+
+				if (data.audioBase64) {
+					const audioBuffer = Buffer.from(data.audioBase64, 'base64');
+					const extension = AUDIO_EXTENSIONS[data.audioContentType] ?? 'wav';
+					const attachment = new AttachmentBuilder(audioBuffer, { name: `voice-message.${extension}` });
 
 					const firstChunk = chunks.shift();
 					await message.channel.send({
