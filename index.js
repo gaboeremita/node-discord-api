@@ -215,7 +215,10 @@ function createBot({ name, tokenEnv, assistantIdEnv, dmAllowlistEnv }) {
 				}, TYPING_REFRESH_INTERVAL_MS);
 
 				const attachment = message.attachments.first();
-				const images = attachment ? [await downloadAttachmentAsBase64(attachment.url)] : [];
+				const isAudioAttachment = attachment?.contentType?.startsWith('audio/');
+
+				const images = attachment && !isAudioAttachment ? [await downloadAttachmentAsBase64(attachment.url)] : [];
+				const audio = attachment && isAudioAttachment ? await downloadAttachmentAsBase64(attachment.url) : null;
 
 				const res = await fetch(`${LARAVEL_API_URL}/assistants/${assistantId}/discord-messages`, {
 					method: 'POST',
@@ -227,6 +230,7 @@ function createBot({ name, tokenEnv, assistantIdEnv, dmAllowlistEnv }) {
 						author_username: message.author.tag,
 						...(message.channel.type === ChannelType.DM ? { dm_username: message.author.username } : {}),
 						...(images.length ? { images } : {}),
+						...(audio ? { audio, audioContentType: attachment.contentType } : {}),
 					}),
 				});
 
