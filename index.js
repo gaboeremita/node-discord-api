@@ -1,6 +1,10 @@
 require('dotenv').config();
 
 const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
 const express = require('express');
 const { Client, Events, GatewayIntentBits, ChannelType, Partials, AttachmentBuilder } = require('discord.js');
 
@@ -20,6 +24,21 @@ const TYPING_REFRESH_INTERVAL_MS = 8_000;
 const MESSAGE_CHUNK_SIZE = 1900;
 const MAX_BOT_REPLY_CHAIN = 2;
 const LOG_FILE_PATH = './discord-api.log';
+
+const CREATE_VIDEO_PATTERN = /^\/create-video(?:\s|$)/i;
+const CONNECTION_FAILED_MESSAGE = 'Connection failed. Try again.';
+const MEGABYTE = 1024 * 1024;
+const DM_UPLOAD_LIMIT_BYTES = 10 * MEGABYTE;
+const UPLOAD_LIMIT_BYTES_BY_TIER = {
+	0: 10 * MEGABYTE,
+	1: 10 * MEGABYTE,
+	2: 50 * MEGABYTE,
+	3: 100 * MEGABYTE,
+};
+const SHRINK_AUDIO_KBPS = 128;
+const SHRINK_FALLBACK_HEIGHT = 480;
+
+const execFileAsync = promisify(execFile);
 
 const AUDIO_EXTENSIONS = {
 	'audio/ogg': 'ogg',
@@ -107,6 +126,90 @@ function nameMatchTerms(username) {
 		.toLowerCase()
 		.split(/[\s_.-]+/)
 		.filter(Boolean);
+}
+
+async function rejectionMessage(res) {
+	const body = await res.text().catch(() => '');
+
+	try {
+		const { message } = JSON.parse(body);
+		if (typeof message === 'string' && message.trim() !== '') {
+			return { body, message };
+		}
+	} catch {
+		// Not JSON: the body is still logged below, and the user gets the generic message.
+	}
+
+	return { body, message: CONNECTION_FAILED_MESSAGE };
+}
+
+function postReply(channel, replyToMessageId, payload) {
+	return channel.send({
+		...payload,
+		...(replyToMessageId ? { reply: { messageReference: replyToMessageId, failIfNotExists: false } } : {}),
+	});
+}
+
+function uploadLimitFor(channel) {
+	if (channel.type === ChannelType.DM) {
+		return DM_UPLOAD_LIMIT_BYTES;
+	}
+
+	return UPLOAD_LIMIT_BYTES_BY_TIER[channel.guild?.premiumTier] ?? UPLOAD_LIMIT_BYTES_BY_TIER[0];
+}
+
+async function encodeVideo(inputPath, outputPath, videoKbps, height = null) {
+	await execFileAsync('ffmpeg', [
+		'-y',
+		'-i', inputPath,
+		...(height ? ['-vf', `scale=-2:${height}`] : []),
+		'-c:v', 'libx264',
+		'-b:v', `${videoKbps}k`,
+		'-maxrate', `${videoKbps}k`,
+		'-bufsize', `${videoKbps * 2}k`,
+		'-c:a', 'aac',
+		'-b:a', `${SHRINK_AUDIO_KBPS}k`,
+		'-movflags', '+faststart',
+		outputPath,
+	]);
+
+	return fs.promises.readFile(outputPath);
+}
+
+async function shrinkToFit(buffer, limitBytes) {
+	const workDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'discord-video-'));
+	const inputPath = path.join(workDir, 'input.mp4');
+
+	try {
+		await fs.promises.writeFile(inputPath, buffer);
+
+		const { stdout } = await execFileAsync('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', inputPath]);
+		const seconds = Number.parseFloat(stdout);
+
+		if (!Number.isFinite(seconds) || seconds <= 0) {
+			throw new Error(`ffprobe reported no usable duration: ${stdout.trim()}`);
+		}
+
+		// 8% under the limit leaves room for the MP4 container's own overhead.
+		const videoKbps = Math.floor((limitBytes * 8 * 0.92) / seconds / 1000) - SHRINK_AUDIO_KBPS;
+
+		if (videoKbps <= 0) {
+			return null;
+		}
+
+		const sameResolution = await encodeVideo(inputPath, path.join(workDir, 'same.mp4'), videoKbps);
+		if (sameResolution.length <= limitBytes) {
+			return sameResolution;
+		}
+
+		const lowerResolution = await encodeVideo(inputPath, path.join(workDir, 'lower.mp4'), videoKbps, SHRINK_FALLBACK_HEIGHT);
+		return lowerResolution.length <= limitBytes ? lowerResolution : null;
+	} catch (err) {
+		logError('shrink-video', { message: err.message, code: err.code ?? null, stack: err.stack });
+		return null;
+	} finally {
+		await fs.promises.rm(workDir, { recursive: true, force: true });
+	}
 }
 
 function chunkText(text, size = MESSAGE_CHUNK_SIZE) {
@@ -203,6 +306,13 @@ function createBot({ name, tokenEnv, assistantIdEnv, dmAllowlistEnv }) {
 			}
 		}
 
+		if (CREATE_VIDEO_PATTERN.test(message.content.trim()) && !dmAllowlist.has(message.author.id)) {
+			await message.channel.send("You can't request videos.").catch((err) => {
+				logError(`${name}: video-access`, { message: err.message, code: err.code ?? null, stack: err.stack });
+			});
+			return;
+		}
+
 		console.log(`[${name}] [${message.guild?.name ?? 'DM'} #${message.channel.name ?? ''}] ${message.author.tag}: ${message.content}`);
 
 		await enqueue(async () => {
@@ -235,9 +345,9 @@ function createBot({ name, tokenEnv, assistantIdEnv, dmAllowlistEnv }) {
 				});
 
 				if (!res.ok) {
-					const body = await res.text().catch(() => '');
-					logError(`${name}: discord-messages`, { message: body || res.statusText, code: res.status });
-					await message.channel.send('Connection failed. Try again.');
+					const rejection = await rejectionMessage(res);
+					logError(`${name}: discord-messages`, { message: rejection.body || res.statusText, code: res.status });
+					await message.channel.send(rejection.message);
 					return;
 				}
 
@@ -276,7 +386,7 @@ function createBot({ name, tokenEnv, assistantIdEnv, dmAllowlistEnv }) {
 				}
 			} catch (err) {
 				logError(`${name}: message-handling`, { message: err.message, code: err.code ?? err.cause?.code ?? null, stack: err.stack });
-				await message.channel.send('Connection failed. Try again.').catch(() => {});
+				await message.channel.send(CONNECTION_FAILED_MESSAGE).catch(() => {});
 			} finally {
 				clearInterval(typingInterval);
 			}
@@ -313,10 +423,83 @@ function discovery(req, res) {
 	res.json({ guilds });
 }
 
+async function deliverVideo(req, res) {
+	const secret = process.env.DISCORD_API_SECRET;
+
+	if (secret && req.headers['x-internal-secret'] !== secret) {
+		return res.status(401).json({ message: 'Unauthorized' });
+	}
+
+	const assistantId = Number(req.params.assistantId);
+	const bot = botsByAssistantId.get(assistantId);
+
+	if (!bot) {
+		return res.status(404).json({ message: `No bot configured for assistant ${assistantId}` });
+	}
+
+	const { replyToMessageId = null, videoUrl = null, failureReason = null } = req.body ?? {};
+
+	if (!videoUrl && !failureReason) {
+		return res.status(400).json({ message: 'Send either videoUrl or failureReason.' });
+	}
+
+	let channel;
+	try {
+		channel = await bot.client.channels.fetch(req.params.channelId);
+	} catch (err) {
+		logError(`${bot.name}: deliver-video channel`, { message: err.message, code: err.code ?? null, stack: err.stack });
+		return res.status(422).json({ message: err.message });
+	}
+
+	let payload;
+	let posted;
+
+	if (failureReason) {
+		payload = { content: `Video failed: ${failureReason}`.slice(0, MESSAGE_CHUNK_SIZE) };
+		posted = 'notice';
+	} else {
+		let buffer;
+		try {
+			const download = await fetch(videoUrl);
+			if (!download.ok) {
+				throw new Error(`video download failed: ${download.status}`);
+			}
+			buffer = Buffer.from(await download.arrayBuffer());
+		} catch (err) {
+			logError(`${bot.name}: deliver-video download`, { message: err.message, code: err.code ?? err.cause?.code ?? null, stack: err.stack });
+			return res.status(502).json({ message: err.message });
+		}
+
+		const limitBytes = uploadLimitFor(channel);
+		if (buffer.length > limitBytes) {
+			buffer = await shrinkToFit(buffer, limitBytes);
+		}
+
+		if (buffer) {
+			payload = { files: [new AttachmentBuilder(buffer, { name: 'video.mp4' })] };
+			posted = 'video';
+		} else {
+			payload = { content: 'Video too large for Discord — watch it in the web app' };
+			posted = 'notice';
+		}
+	}
+
+	try {
+		await postReply(channel, replyToMessageId, payload);
+	} catch (err) {
+		logError(`${bot.name}: deliver-video post`, { message: err.message, code: err.code ?? null, stack: err.stack });
+		return res.status(422).json({ message: err.message });
+	}
+
+	res.json({ posted });
+}
+
 bots.forEach(createBot);
 
 const app = express();
+app.use(express.json());
 app.get('/assistants/:assistantId/discovery', discovery);
+app.post('/assistants/:assistantId/channels/:channelId/videos', deliverVideo);
 
 const port = process.env.DISCORD_API_PORT || 3001;
 app.listen(port, () => console.log(`Discovery server listening on :${port}`));
